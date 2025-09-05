@@ -5,16 +5,11 @@ Labirinto dos Processos — Fantasmas SSE v3 (versão em Português)
 - UI em tempo real via Server-Sent Events (SSE)
 - Fantasmas (Pac-Man) com animação suave + anel de progresso + legenda de atividade
 - Labirinto GERADO (DFS): conectado; saída é a célula mais distante do início; 2 pontos de controle e 1 gargalo obrigatórios
-- Processos reais (multiprocessing): parar/continuar/encerrar (SIGSTOP/SIGCONT/SIGTERM)
+- Processos reais (multiprocessing) com PAUSA/CONTINUA/KILL multiplataforma (cooperação via flags)
 - Sincronização: semáforo no 'G'
-
-Observações sobre a tradução para PT-BR:
-- Todos os nomes de variáveis, funções, chaves de mensagens, endpoints e textos de UI foram traduzidos.
-- O marcador da "saída" no grid foi alterado de 'E' (Exit) para 'S' (Saída).
-- A estrutura geral e o comportamento permanecem equivalentes à versão original.
 """
 
-import os, signal, time, random, json, threading, queue
+import os, signal, time, random, json, threading, queue, sys
 from collections import deque
 from multiprocessing import Process, Queue as FilaMP, Manager, Semaphore
 from flask import Flask, Response, request
@@ -226,8 +221,13 @@ def tarefa_io(segundos=1.1):
 
 # ===================== Agente (processo) =====================
 
-def agente(nome, pos_inicial, fila_saida: FilaMP, gargalo: Semaphore, passo_ms=170):
-    """Processo que caminha no labirinto, executa tarefas nos 'C' e finaliza ao chegar na 'S'."""
+# Detecta se há suporte a sinais POSIX (Linux/macOS). No Windows, usaremos flags cooperativas.
+POSIX_SIGNALS = (os.name != 'nt') and hasattr(signal, 'SIGSTOP') and hasattr(signal, 'SIGCONT')
+
+def agente(nome, pos_inicial, fila_saida: FilaMP, gargalo: Semaphore, pausa_flags, kill_flags, passo_ms=170):
+    """Processo que caminha no labirinto, executa tarefas nos 'C' e finaliza ao chegar na 'S'.
+    Suporta pausa/continuação/encerramento via flags compartilhadas (multiplataforma).
+    """
     pid = os.getpid()
     random.seed(pid ^ int(time.time()))
     l, c = pos_inicial
@@ -238,19 +238,24 @@ def agente(nome, pos_inicial, fila_saida: FilaMP, gargalo: Semaphore, passo_ms=1
         nonlocal rodando
         rodando = False
 
+    # Mesmo no Windows, SIGTERM existe; usamos para término cooperativo/forçado
     signal.signal(signal.SIGTERM, ao_terminar)
 
     def emitir(tipo, atividade):
         """Enfileira um evento para a UI/SSE com o estado atual do agente."""
-        fila_saida.put({
-            "tipo": tipo,
-            "pid": pid,
-            "nome": nome,
-            "posicao": [l, c],
-            "feito": concluido,
-            "total": total,
-            "atividade": atividade
-        }, block=False)
+        try:
+            fila_saida.put({
+                "tipo": tipo,
+                "pid": pid,
+                "nome": nome,
+                "posicao": [l, c],
+                "feito": concluido,
+                "total": total,
+                "atividade": atividade,
+                "pausado": bool(pausa_flags.get(pid, False))
+            }, block=False)
+        except Exception:
+            pass
 
     tarefas = [
         ("primos 170k", lambda: tarefa_primos(170000)),
@@ -261,10 +266,21 @@ def agente(nome, pos_inicial, fila_saida: FilaMP, gargalo: Semaphore, passo_ms=1
     emitir("nascimento", "iniciando")
 
     while rodando:
+        # Encerramento cooperativo
+        if kill_flags.get(pid, False):
+            emitir("fim", "encerrado pelo gerenciador")
+            break
+
+        # Pausa cooperativa
+        if pausa_flags.get(pid, False):
+            emitir("estado", "pausado")
+            time.sleep(0.25)
+            continue
+
         alvos = set(PONTOS) if concluido < total else {SAIDA}
         passo = proximo_passo_bfs((l, c), alvos)
         if not passo:
-            # Sem caminho encontrado no momento (deveria ser raro). Move aleatório válido.
+            # Sem caminho encontrado no momento (raro). Move aleatório válido.
             opcoes = [(nl, nc) for nl, nc in vizinhos(l, c) if caminhavel(nl, nc)]
             if not opcoes:
                 time.sleep(passo_ms / 1000)
@@ -276,7 +292,16 @@ def agente(nome, pos_inicial, fila_saida: FilaMP, gargalo: Semaphore, passo_ms=1
         # Controle de concorrência no gargalo (G)
         if celula(nl, nc) == 'G':
             emitir("estado", "aguardando semáforo")
-            gargalo.acquire()
+            sem_obtido = False
+            while not sem_obtido:
+                if kill_flags.get(pid, False):
+                    emitir("fim", "encerrado pelo gerenciador")
+                    return
+                if not pausa_flags.get(pid, False):
+                    sem_obtido = gargalo.acquire(timeout=0.1)
+                else:
+                    emitir("estado", "pausado")
+                    time.sleep(0.25)
             emitir("estado", "entrando no gargalo")
             time.sleep(passo_ms / 1000)
             gargalo.release()
@@ -315,10 +340,14 @@ app = Flask(__name__)
 _gerenciador = Manager()
 compartilhado = _gerenciador.dict()   # pid -> último estado emitido
 filhos = {}                           # pid -> (Processo, nome)
-parados = set()                       # PIDs em SIGSTOP
+parados = set()                       # PIDs parados (visão do servidor)
 buffer_logs = deque(maxlen=500)       # histórico de logs para a UI
 fila_eventos = FilaMP(maxsize=10000)  # fila principal de eventos dos agentes
 sem_gargalo = Semaphore(1)            # semáforo do gargalo 'G'
+
+# NOVO: flags cooperativas multiplataforma
+pausa_flags = _gerenciador.dict()     # pid -> bool
+kill_flags  = _gerenciador.dict()     # pid -> bool
 
 # pub/sub simples para SSE
 _assinantes = set()
@@ -364,6 +393,8 @@ def bomba_eventos():
                 proc.join(timeout=0.1)
             filhos.pop(pid, None)
             parados.discard(pid)
+            pausa_flags.pop(pid, None)
+            kill_flags.pop(pid, None)
 
 def gerar(qtd=3):
     """Cria 'qtd' agentes em células livres, evitando S/C/G na largada."""
@@ -373,17 +404,58 @@ def gerar(qtd=3):
     for i in range(qtd):
         pos = candidatos[i % len(candidatos)]
         nome = f"Fantasma-{int(time.time()) % 10000}-{i + 1}"
-        p = Process(target=agente, args=(nome, pos, fila_eventos, sem_gargalo, 170), daemon=True)
+        p = Process(target=agente, args=(nome, pos, fila_eventos, sem_gargalo, pausa_flags, kill_flags, 170), daemon=True)
         p.start()
         filhos[p.pid] = (p, nome)
+        pausa_flags[p.pid] = False
+        kill_flags[p.pid] = False
         _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: criado {nome}:{p.pid} em {pos}")
 
-def _enviar_sinal(pid, sinal_obj):
-    try:
-        os.kill(pid, sinal_obj)
-        return True
-    except ProcessLookupError:
+# ===================== Endpoints auxiliares =====================
+
+def _parar_pid(pid: int):
+    if pid not in filhos:
         return False
+    if POSIX_SIGNALS:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            return True
+        except ProcessLookupError:
+            return False
+    else:
+        pausa_flags[pid] = True
+        return True
+
+def _continuar_pid(pid: int):
+    if pid not in filhos:
+        return False
+    if POSIX_SIGNALS:
+        try:
+            os.kill(pid, signal.SIGCONT)
+            return True
+        except ProcessLookupError:
+            return False
+    else:
+        pausa_flags[pid] = False
+        return True
+
+def _matar_pid(pid: int):
+    if pid not in filhos:
+        return False
+    kill_flags[pid] = True
+    # Fallback imediato: tenta encerrar o processo objeto se disponível
+    proc = filhos.get(pid, (None, None))[0]
+    if proc is not None and proc.is_alive():
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    if POSIX_SIGNALS:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return True
 
 # ===================== Endpoints SSE/HTTP =====================
 
@@ -431,25 +503,52 @@ def api_novo():
 @app.post("/api/parar")
 def api_parar():
     pid = int(request.args.get("pid", "0"))
-    if pid in filhos and _enviar_sinal(pid, signal.SIGSTOP):
+    if pid in filhos and _parar_pid(pid):
         parados.add(pid)
-        _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: SIGSTOP -> {pid}")
+        _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: PARAR -> {pid}")
     return ("", 204)
 
 @app.post("/api/continuar")
 def api_continuar():
     pid = int(request.args.get("pid", "0"))
-    if pid in filhos and _enviar_sinal(pid, signal.SIGCONT):
+    if pid in filhos and _continuar_pid(pid):
         parados.discard(pid)
-        _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: SIGCONT -> {pid}")
+        _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: CONTINUAR -> {pid}")
     return ("", 204)
 
 @app.post("/api/matar")
 def api_matar():
     pid = int(request.args.get("pid", "0"))
-    if pid in filhos and _enviar_sinal(pid, signal.SIGTERM):
+    if pid in filhos and _matar_pid(pid):
         parados.discard(pid)
-        _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: SIGTERM -> {pid}")
+        _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: MATAR -> {pid}")
+    return ("", 204)
+
+@app.post("/api/pararTodos")
+def api_parar_todos():
+    """Para todos os processos ativos."""
+    for pid in list(filhos.keys()):
+        _parar_pid(pid)
+        parados.add(pid)
+    _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: PARAR TODOS")
+    return ("", 204)
+
+@app.post("/api/continuarTodos")
+def api_continuar_todos():
+    """Continua todos os processos parados."""
+    for pid in list(filhos.keys()):
+        _continuar_pid(pid)
+        parados.discard(pid)
+    _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: CONTINUAR TODOS")
+    return ("", 204)
+
+@app.post("/api/matarTodos")
+def api_matar_todos():
+    """Encerra todos os processos."""
+    for pid in list(filhos.keys()):
+        _matar_pid(pid)
+        parados.discard(pid)
+    _logar(f"{time.strftime('%H:%M:%S')} | gerenciador :: MATAR TODOS")
     return ("", 204)
 
 # ===================== UI (HTML/JS) =====================
@@ -459,191 +558,496 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Labirinto dos Processos — Fantasmas SSE v3</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
-:root{color-scheme:dark}
-body{margin:0;background:#0b0e14;color:#eaf0f7;font-family:Inter,system-ui,Arial,sans-serif;display:grid;grid-template-columns: minmax(740px, 1fr) clamp(380px, 33vw, 540px);height:100vh}
-#esquerda{padding:14px}
-#direita{padding:14px;border-left:1px solid #1b2130;overflow:auto}
-#quadro{position:relative;width:fit-content;border:1px solid #1b2130;background:#0a0d12}
-canvas{image-rendering:pixelated;display:block}
-h1{margin:0 0 10px 0;font-size:20px}
-.botao{padding:8px 10px;border-radius:8px;background:#1a2130;border:1px solid #2a3347;color:#eaf0f7;cursor:pointer}
-.botao:hover{background:#202a3e}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
-th,td{border-bottom:1px solid #1b2130;padding:6px 6px;text-align:left}
-.pilula{padding:2px 8px;border-radius:999px;background:#1a2130}
-#painel{display:grid;grid-template-columns:1fr 120px;gap:8px;margin-bottom:8px}
-input[type=number]{padding:8px;background:#0c0f14;border:1px solid #1b2130;color:#eaf0f7;border-radius:8px}
-#logs{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0a0c10;border:1px solid #1b2130;border-radius:8px;padding:8px;height:240px;overflow:auto}
-.legenda{margin-top:8px;color:#a8b2c2;font-size:13px}
-.etiqueta{font-size:11px;padding:2px 6px;border:1px solid #2a3347;background:#141925;border-radius:6px;color:#cfd7e6}
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-tertiary: #334155;
+  --accent-primary: #3b82f6;
+  --accent-secondary: #8b5cf6;
+  --accent-tertiary: #10b981;
+  --text-primary: #f1f5f9;
+  --text-secondary: #cbd5e1;
+  --text-muted: #64748b;
+  --border-color: #334155;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #3b82f6;
+  --grid-size: 22px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  margin: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  display: grid;
+  grid-template-columns: minmax(740px, 1fr) clamp(380px, 33vw, 540px);
+  height: 100vh;
+  overflow: hidden;
+}
+
+#esquerda { padding: 20px; display: flex; flex-direction: column; gap: 16px; overflow: auto; }
+#direita { padding: 20px; border-left: 1px solid var(--border-color); overflow: auto; display: flex; flex-direction: column; gap: 20px; }
+
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.header h1 { font-size: 24px; font-weight: 600; color: var(--text-primary); }
+.header-controls { display: none; gap: 8px; align-items: center; }
+
+#quadro { position: relative; width: fit-content; border: 1px solid var(--border-color); background: var(--bg-secondary); border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2); }
+
+canvas { image-rendering: pixelated; display: block; }
+
+.controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+
+.botao { padding: 10px 16px; border-radius: 8px; background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--text-primary); cursor: pointer; font-weight: 500; display: flex; align-items: center; gap: 6px; transition: all 0.2s ease; }
+.botao:hover { background: #475569; transform: translateY(-1px); }
+.botao.primary { background: var(--accent-primary); border-color: var(--accent-primary); }
+.botao.primary:hover { background: #2563eb; }
+.botao.danger { background: var(--danger); border-color: var(--danger); }
+.botao.danger:hover { background: #dc2626; }
+.botao.success { background: var(--success); border-color: var(--success); }
+.botao.success:hover { background: #059669; }
+.botao.warning { background: var(--warning); border-color: var(--warning); }
+.botao.warning:hover { background: #d97706; }
+.botao.small { padding: 6px 10px; font-size: 12px; }
+
+input[type="number"] { padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 8px; width: 80px; }
+
+.card { background: var(--bg-secondary); border-radius: 12px; padding: 16px; border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.card-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
+.card-actions { display: flex; gap: 8px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 8px; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border-color); }
+th { font-weight: 500; color: var(--text-secondary); background: var(--bg-tertiary); position: sticky; top: 0; }
+tr:hover { background: rgba(255, 255, 255, 0.05); }
+
+.pilula { padding: 4px 10px; border-radius: 999px; background: var(--bg-tertiary); font-size: 12px; font-weight: 500; display: inline-block; text-align: center; min-width: 50px; }
+.pilula.completed { background: var(--success); color: white; }
+.pilula.partial { background: var(--warning); color: white; }
+.pilula.pending { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+.legenda { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text-secondary); }
+.legenda-item { display: flex; align-items: center; gap: 6px; }
+.legenda-cor { width: 16px; height: 16px; border-radius: 4px; display: inline-block; }
+.cor-parede { background: #0f172a; }
+.cor-caminho { background: #334155; }
+.cor-checkpoint { background: #f59e0b; }
+.cor-gargalo { background: #8b5cf6; }
+.cor-saida { background: #10b981; }
+
+#logs { font: 13px 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; height: 240px; overflow: auto; display: flex; flex-direction: column-reverse; }
+.log-entry { padding: 4px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); color: var(--text-secondary); }
+.log-entry:last-child { border-bottom: none; }
+.log-time { color: var(--accent-primary); margin-right: 8px; }
+.log-pid { color: var(--accent-secondary); margin-right: 4px; font-weight: 500; }
+.log-name { color: var(--text-primary); font-weight: 500; margin-right: 4px; }
+.log-activity { color: var(--text-secondary); }
+
+.stats { display: flex; gap: 16px; margin-bottom: 16px; }
+.stat-card { background: var(--bg-secondary); border-radius: 8px; padding: 12px; border: 1px solid var(--border-color); flex: 1; text-align: center; }
+.stat-value { font-size: 24px; font-weight: 600; color: var(--accent-primary); margin-bottom: 4px; }
+.stat-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+
+.etiqueta { font-size: 12px; padding: 4px 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); border-radius: 6px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 4px; }
+
+.help-icon { color: var(--text-muted); cursor: help; }
+.tooltip { position: relative; }
+.tooltip-text { visibility: hidden; width: 200px; background: var(--bg-tertiary); color: var(--text-primary); text-align: center; border-radius: 6px; padding: 8px; position: absolute; z-index: 1; bottom: 125%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height: 1.4; }
+.tooltip:hover .tooltip-text { visibility: visible; opacity: 1; }
+
+.empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); }
+.empty-state i { font-size: 32px; margin-bottom: 12px; opacity: 0.5; }
+.empty-state p { margin-top: 8px; font-size: 14px; }
+
+.progress-ring { transition: stroke-dashoffset 0.3s; }
+@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+.pulsing { animation: pulse 2s infinite; }
 </style>
 </head>
 <body>
 <div id="esquerda">
-  <h1>Labirinto dos Processos — <span class="etiqueta">Fantasmas SSE v3</span></h1>
+  <div class="header">
+    <h1>Labirinto dos Processos <span class="etiqueta"><i class="fas fa-ghost"></i> Fantasmas SSE v3</span></h1>
+    <div class="header-controls">
+      <div class="tooltip">
+        <button class="botao" id="ajudaBtn"><i class="fas fa-question-circle"></i></button>
+        <span class="tooltip-text">Cada fantasma é um processo que precisa completar 3 tarefas (nos pontos C) antes de sair pelo S. O G é um gargalo controlado por semáforo.</span>
+      </div>
+      <div class="tooltip">
+        <button class="botao" id="refreshBtn"><i class="fas fa-sync-alt"></i> Atualizar Labirinto</button>
+        <span class="tooltip-text">Gera um novo labirinto aleatório</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="stat-value" id="total-processos">0</div>
+      <div class="stat-label">Processos Ativos</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="processos-parados">0</div>
+      <div class="stat-label">Processos Pausados</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="processos-finalizados">0</div>
+      <div class="stat-label">Processos Finalizados</div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <input id="qtd" type="number" min="1" max="20" value="3">
+    <button class="botao primary" id="criarBtn"><i class="fas fa-plus-circle"></i> Criar Novos Processos</button>
+    <button class="botao warning" id="pararTodosBtn"><i class="fas fa-pause"></i> Parar Todos</button>
+    <button class="botao success" id="continuarTodosBtn"><i class="fas fa-play"></i> Continuar Todos</button>
+    <button class="botao danger" id="matarTodosBtn"><i class="fas fa-skull"></i> Encerrar Todos</button>
+  </div>
+
   <div id="quadro">
     <canvas id="labirinto"></canvas>
     <canvas id="atores" style="position:absolute;left:0;top:0;"></canvas>
     <canvas id="rotulos" style="position:absolute;left:0;top:0;pointer-events:none;"></canvas>
   </div>
-  <div class="legenda"># Parede • . Caminho • <b>C</b> Ponto de Controle • <b>G</b> Gargalo • <b>S</b> Saída</div>
-</div>
-<div id="direita">
-  <div id="painel">
-    <input id="qtd" type="number" min="1" value="3">
-    <button class="botao" id="criarBtn">Criar Novos</button>
+
+  <div class="legenda">
+    <div class="legenda-item"><span class="legenda-cor cor-parede"></span> Parede</div>
+    <div class="legenda-item"><span class="legenda-cor cor-caminho"></span> Caminho</div>
+    <div class="legenda-item"><span class="legenda-cor cor-checkpoint"></span> Ponto de Controle (C)</div>
+    <div class="legenda-item"><span class="legenda-cor cor-gargalo"></span> Gargalo (G)</div>
+    <div class="legenda-item"><span class="legenda-cor cor-saida"></span> Saída (S)</div>
   </div>
-  <table>
-    <thead><tr><th>PID</th><th>Nome</th><th>Posição</th><th>Progresso</th><th>Atividade</th><th>Ações</th></tr></thead>
-    <tbody id="tcorpo"></tbody>
-  </table>
-  <h3>Logs</h3>
-  <div id="logs"></div>
+</div>
+
+<div id="direita">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Processos Ativos</div>
+      <div class="card-actions">
+        <button class="botao small" id="expandirBtn"><i class="fas fa-expand"></i></button>
+        <button class="botao small" id="recolherBtn"><i class="fas fa-compress"></i></button>
+      </div>
+    </div>
+    <div style="height: 400px; overflow: auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>PID</th>
+            <th>Nome</th>
+            <th>Posição</th>
+            <th>Progresso</th>
+            <th>Atividade</th>
+            <th>Ações</th>
+          </tr>
+        </thead>
+        <tbody id="tcorpo">
+          <tr>
+            <td colspan="6" class="empty-state">
+              <i class="fas fa-ghost"></i>
+              <p>Nenhum processo ativo</p>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Log do Sistema</div>
+      <div class="card-actions">
+        <button class="botao small" id="limparLogsBtn"><i class="fas fa-trash"></i> Limpar</button>
+      </div>
+    </div>
+    <div id="logs"></div>
+  </div>
 </div>
 
 <script>
 let linhas=0, colunas=0, grade=[];
-const tam=22; // tamanho do ladrilho (px)
-const cnvLab=document.getElementById('labirinto');
-const cnvAtores=document.getElementById('atores');
-const cnvRotulos=document.getElementById('rotulos');
-const ctxL=cnvLab.getContext('2d');
-const ctxA=cnvAtores.getContext('2d');
-const ctxR=cnvRotulos.getContext('2d');
+const tam = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--grid-size') || 22);
+const cnvLab = document.getElementById('labirinto');
+const cnvAtores = document.getElementById('atores');
+const cnvRotulos = document.getElementById('rotulos');
+const ctxL = cnvLab.getContext('2d');
+const ctxA = cnvAtores.getContext('2d');
+const ctxR = cnvRotulos.getContext('2d');
+
+// Estatísticas
+let totalProcessos = 0;
+let processosParados = 0;
+let processosFinalizados = 0;
+
+function atualizarEstatisticas() {
+  document.getElementById('total-processos').textContent = totalProcessos;
+  document.getElementById('processos-parados').textContent = processosParados;
+  document.getElementById('processos-finalizados').textContent = processosFinalizados;
+}
 
 function desenharLabirinto(){
-  cnvLab.width=colunas*tam; cnvLab.height=linhas*tam;
-  cnvAtores.width=cnvLab.width; cnvAtores.height=cnvLab.height;
-  cnvRotulos.width=cnvLab.width; cnvRotulos.height=cnvLab.height;
-  for(let l=0;l<linhas;l++){
-    for(let c=0;c<colunas;c++){
-      const ch=grade[l][c];
-      let cor="#ffffff";
-      if(ch=='#') cor="#0b0d12";
-      else if(ch=='C') cor="#f6a032";
-      else if(ch=='G') cor="#8e6eea";
-      else if(ch=='S') cor="#44cc77";
-      ctxL.fillStyle=cor;
-      ctxL.fillRect(c*tam, l*tam, tam, tam);
-      if(ch=='.'){ ctxL.strokeStyle="#222a3b"; ctxL.lineWidth=0.5; ctxL.strokeRect(c*tam, l*tam, tam, tam); }
+  cnvLab.width = colunas * tam;
+  cnvLab.height = linhas * tam;
+  cnvAtores.width = cnvLab.width;
+  cnvAtores.height = cnvLab.height;
+  cnvRotulos.width = cnvLab.width;
+  cnvRotulos.height = cnvLab.height;
+
+  for(let l = 0; l < linhas; l++){
+    for(let c = 0; c < colunas; c++){
+      const ch = grade[l][c];
+      let cor = "#0f172a"; // padrão (parede)
+      if(ch === '.') cor = "#334155"; // caminho
+      else if(ch === 'C') cor = "#f59e0b"; // checkpoint
+      else if(ch === 'G') cor = "#8b5cf6"; // gargalo
+      else if(ch === 'S') cor = "#10b981"; // saída
+      ctxL.fillStyle = cor;
+      ctxL.fillRect(c * tam, l * tam, tam, tam);
+      if(ch === '.') { // textura sutil
+        ctxL.fillStyle = 'rgba(0, 0, 0, 0.08)';
+        ctxL.fillRect(c * tam + 2, l * tam + 2, tam - 4, tam - 4);
+      }
     }
   }
 }
 
-function centro(pos){ return [pos[1]*tam + tam/2, pos[0]*tam + tam/2]; }
-function corHSL(pid){ const h=Math.abs(pid)%360; return `hsl(${h} 75% 55%)`; }
+function centro(pos){ return [pos[1] * tam + tam / 2, pos[0] * tam + tam / 2]; }
+function corHSL(pid){ const h = Math.abs(pid) % 360; return `hsl(${h}, 75%, 65%)`; }
 
-const fantasmas=new Map(); // pid -> estado
-const DUR=170; // ms por passo (deve casar com o servidor)
+const fantasmas = new Map(); // pid -> estado
+const DUR = 170; // ms por passo (deve casar com o servidor)
 
 function inserirOuAtualizar(msg){
-  const pid=msg.pid;
-  const g = fantasmas.get(pid) || {x:0,y:0,tx:0,ty:0,t0:performance.now(),t1:performance.now(),dir:[1,0],nome:msg.nome||`Fantasma-${pid}`,cor:corHSL(pid),feito:0,total:3,atividade:""};
+  const pid = msg.pid;
+  const g = fantasmas.get(pid) || {
+    x: 0, y: 0, tx: 0, ty: 0, t0: performance.now(), t1: performance.now(), dir: [1, 0],
+    nome: msg.nome || `Fantasma-${pid}`, cor: corHSL(pid), feito: 0, total: 3, atividade: "", estado: "ativo"
+  };
+
   if(msg.posicao){
-    const [nx,ny]=centro(msg.posicao);
-    const dx = nx - (g.tx ?? nx), dy = ny - (g.ty ?? ny);
-    const len = Math.hypot(dx,dy) || 1;
-    g.dir=[dx/len, dy/len];
-    g.x = g.tx ?? nx; g.y = g.ty ?? ny;
-    g.tx=nx; g.ty=ny; g.t0=performance.now(); g.t1=g.t0 + DUR;
+    const [nx, ny] = centro(msg.posicao);
+    const dx = nx - (g.tx ?? nx);
+    const dy = ny - (g.ty ?? ny);
+    const len = Math.hypot(dx, dy) || 1;
+    g.dir = [dx/len, dy/len];
+    g.x = g.tx ?? nx;
+    g.y = g.ty ?? ny;
+    g.tx = nx;
+    g.ty = ny;
+    g.t0 = performance.now();
+    g.t1 = g.t0 + DUR;
   }
-  if(typeof msg.nome==='string') g.nome=msg.nome;
-  if(typeof msg.feito==='number') g.feito=msg.feito;
-  if(typeof msg.total==='number') g.total=msg.total;
-  if(typeof msg.atividade==='string') g.atividade=msg.atividade;
-  fantasmas.set(pid,g);
+
+  if(typeof msg.nome === 'string') g.nome = msg.nome;
+  if(typeof msg.feito === 'number') g.feito = msg.feito;
+  if(typeof msg.total === 'number') g.total = msg.total;
+  if(typeof msg.atividade === 'string') g.atividade = msg.atividade;
+  if(typeof msg.pausado === 'boolean') g.estado = msg.pausado ? 'pausado' : 'ativo';
+
+  fantasmas.set(pid, g);
   desenharTabela();
+  atualizarContadores();
 }
 
-function desenharFantasma(ctx, x, y, r, cor, dir){
-  ctx.save(); ctx.translate(x,y);
-  ctx.fillStyle=cor;
+function desenharFantasma(ctx, x, y, r, cor, dir, estado) {
+  ctx.save();
+  ctx.translate(x, y);
+  if (estado === "pausado") ctx.globalAlpha = 0.6;
+  ctx.fillStyle = cor;
   ctx.beginPath();
-  ctx.arc(0, -r*0.2, r, Math.PI, 0, false);
-  ctx.lineTo(r, r*0.7);
-  const k=5, passo=(r*2)/k;
-  for(let i=0;i<k;i++){ ctx.arc(r - passo*(i+0.5), r*0.7, passo/2, 0, Math.PI, true); }
+  ctx.arc(0, -r * 0.2, r, Math.PI, 0, false);
+  ctx.lineTo(r, r * 0.7);
+  const k = 5; const passo = (r * 2) / k;
+  for(let i = 0; i < k; i++) ctx.arc(r - passo * (i + 0.5), r * 0.7, passo / 2, 0, Math.PI, true);
   ctx.closePath(); ctx.fill();
-  const ex=Math.max(-1,Math.min(1,dir[0])), ey=Math.max(-1,Math.min(1,dir[1]));
-  const offX=ex*r*0.20, offY=ey*r*0.20;
-  function olho(cx,cy){
-    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.ellipse(cx,cy, r*0.28, r*0.36, 0, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle="#142a66"; ctx.beginPath(); ctx.arc(cx+offX, cy+offY, r*0.15, 0, Math.PI*2); ctx.fill();
+  const ex = Math.max(-1, Math.min(1, dir[0]));
+  const ey = Math.max(-1, Math.min(1, dir[1]));
+  const offX = ex * r * 0.20; const offY = ey * r * 0.20;
+  function olho(cx, cy) {
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.ellipse(cx, cy, r * 0.28, r * 0.36, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#142a66"; ctx.beginPath(); ctx.arc(cx + offX, cy + offY, r * 0.15, 0, Math.PI * 2); ctx.fill();
   }
-  olho(-r*0.35, -r*0.25); olho(r*0.15, -r*0.25);
+  olho(-r * 0.35, -r * 0.25); olho(r * 0.15, -r * 0.25);
+  if (estado === "pausado") {
+    ctx.fillStyle = "rgba(239, 68, 68, 0.8)"; ctx.beginPath(); ctx.arc(0, 0, r * 0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "white"; ctx.font = "bold " + (r * 0.5) + "px Arial"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("⏸", 0, 0);
+  }
   ctx.restore();
 }
 
 function animar(){
-  ctxA.clearRect(0,0,cnvAtores.width,cnvAtores.height);
-  ctxR.clearRect(0,0,cnvRotulos.width,cnvRotulos.height);
-  const t=performance.now();
-  fantasmas.forEach((g,pid)=>{
-    const k=Math.max(0,Math.min(1,(t-g.t0)/(g.t1-g.t0)));
-    const x=g.x+(g.tx-g.x)*k, y=g.y+(g.ty-g.y)*k;
-    desenharFantasma(ctxA, x, y, tam*0.45, g.cor, g.dir);
-    const frac = g.total? (g.feito/g.total): 0;
-    ctxA.beginPath(); ctxA.arc(x,y, tam*0.56, -Math.PI/2, -Math.PI/2 + frac*2*Math.PI);
-    ctxA.lineWidth=3; ctxA.strokeStyle="#62ff99"; ctxA.stroke();
-    const etiqueta = `${g.nome}  •  ${g.atividade||'-'}`;
+  ctxA.clearRect(0, 0, cnvAtores.width, cnvAtores.height);
+  ctxR.clearRect(0, 0, cnvRotulos.width, cnvRotulos.height);
+
+  const t = performance.now();
+  fantasmas.forEach((g, pid) => {
+    const k = Math.max(0, Math.min(1, (t - g.t0) / (g.t1 - g.t0)));
+    const x = g.x + (g.tx - g.x) * k;
+    const y = g.y + (g.ty - g.y) * k;
+
+    desenharFantasma(ctxA, x, y, tam * 0.45, g.cor, g.dir, g.estado);
+
+    // Anel de progresso
+    const frac = g.total ? (g.feito / g.total) : 0;
+    ctxA.beginPath(); ctxA.arc(x, y, tam * 0.56, -Math.PI/2, -Math.PI/2 + frac * 2 * Math.PI); ctxA.lineWidth = 3; ctxA.strokeStyle = "#62ff99"; ctxA.stroke();
+
+    // Etiqueta com nome e atividade
+    const etiqueta = `${g.nome} • ${g.atividade || '-'}`;
+    ctxR.font = "12px 'SF Mono', 'Monaco', monospace"; // GARANTE medida consistente
     const w = Math.max(140, ctxR.measureText(etiqueta).width + 12);
     const h = 16;
-    ctxR.fillStyle="rgba(0,0,0,0.55)";
-    ctxR.fillRect(x-w/2, y-(tam*0.95)-h, w, h);
-    ctxR.fillStyle="#dfe6f0"; ctxR.font="12px ui-monospace,monospace";
-    ctxR.textAlign="center"; ctxR.textBaseline="bottom"; ctxR.fillText(etiqueta, x, y-(tam*0.95));
+    ctxR.fillStyle = "rgba(15, 23, 42, 0.85)"; ctxR.fillRect(x - w/2, y - (tam * 0.95) - h, w, h);
+    ctxR.fillStyle = "#e2e8f0"; ctxR.textAlign = "center"; ctxR.textBaseline = "bottom"; ctxR.fillText(etiqueta, x, y - (tam * 0.95));
   });
+
   requestAnimationFrame(animar);
 }
 
-function desenharTabela(){
-  const tb=document.getElementById('tcorpo'); tb.innerHTML='';
-  fantasmas.forEach((g,pid)=>{
-    const ll=Math.round((g.y-tam/2)/tam), cc=Math.round((g.x-tam/2)/tam);
-    const tr=document.createElement('tr');
+function desenharTabela() {
+  const tb = document.getElementById('tcorpo');
+  if (fantasmas.size === 0) {
+    tb.innerHTML = `
+      <tr>
+        <td colspan="6" class="empty-state">
+          <i class="fas fa-ghost"></i>
+          <p>Nenhum processo ativo</p>
+        </td>
+      </tr>`;
+    return;
+  }
+  tb.innerHTML = '';
+  fantasmas.forEach((g, pid) => {
+    const ll = Math.round((g.y - tam/2) / tam);
+    const cc = Math.round((g.x - tam/2) / tam);
+    let classePilula = 'pending';
+    if (g.feito === g.total) classePilula = 'completed';
+    else if (g.feito > 0) classePilula = 'partial';
+    const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${pid}</td><td>${g.nome}</td><td>${ll},${cc}</td>
-      <td><span class="pilula">${g.feito}/${g.total}</span></td>
-      <td>${g.atividade||'-'}</td>
+      <td>${pid}</td>
+      <td>${g.nome}</td>
+      <td>${ll},${cc}</td>
+      <td><span class="pilula ${classePilula}">${g.feito}/${g.total}</span></td>
+      <td>${g.atividade || '-'}</td>
       <td>
-        <button class="botao" data-acao="parar" data-pid="${pid}">parar</button>
-        <button class="botao" data-acao="continuar" data-pid="${pid}">continuar</button>
-        <button class="botao" data-acao="matar" data-pid="${pid}">matar</button>
+        <button class="botao small warning" data-acao="parar" data-pid="${pid}"><i class="fas fa-pause"></i></button>
+        <button class="botao small success" data-acao="continuar" data-pid="${pid}"><i class="fas fa-play"></i></button>
+        <button class="botao small danger" data-acao="matar" data-pid="${pid}"><i class="fas fa-skull"></i></button>
       </td>`;
     tb.appendChild(tr);
   });
 }
 
-document.addEventListener('click', async (ev)=>{
-  const t=ev.target; if(!t.matches('button[data-acao]')) return;
-  const pid=t.getAttribute('data-pid'); const acao=t.getAttribute('data-acao');
-  await fetch(`/api/${acao}?pid=${pid}`,{method:'POST'});
-});
-document.getElementById('criarBtn').addEventListener('click', async ()=>{
-  const n=Math.max(1, Math.min(20, parseInt(document.getElementById('qtd').value||'1',10)));
-  await fetch(`/api/novo?quantidade=${n}`,{method:'POST'});
+function atualizarContadores() {
+  totalProcessos = fantasmas.size;
+  processosParados = Array.from(fantasmas.values()).filter(g => g.estado === "pausado").length;
+  atualizarEstatisticas();
+}
+
+// ################ LOGS: agora suportando TEXTO e HTML formatado ################
+const logs = document.getElementById('logs');
+function addLog(content, asHTML=false) {
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  if (asHTML) {
+    div.innerHTML = content; // usamos apenas com HTML gerado localmente
+  } else {
+    div.textContent = content; // conteúdo vindo do servidor permanece texto
+  }
+  logs.prepend(div);
+  while (logs.childElementCount > 200) logs.removeChild(logs.lastChild);
+}
+
+// Event listeners para os botões (corrigido: usa closest para capturar o <button> mesmo se clicar no <i>)
+document.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-acao]');
+  if (!btn) return;
+  const pid = btn.getAttribute('data-pid');
+  const acao = btn.getAttribute('data-acao');
+
+  if (acao === 'parar' && fantasmas.has(parseInt(pid))) {
+    fantasmas.get(parseInt(pid)).estado = "pausado";
+  } else if (acao === 'continuar' && fantasmas.has(parseInt(pid))) {
+    fantasmas.get(parseInt(pid)).estado = "ativo";
+  }
+  desenharTabela();
+  atualizarContadores();
+
+  try { await fetch(`/api/${acao}?pid=${pid}`, { method: 'POST' }); } catch (e) { console.error(e); }
 });
 
+document.getElementById('criarBtn').addEventListener('click', async () => {
+  const n = Math.max(1, Math.min(20, parseInt(document.getElementById('qtd').value || '1', 10)));
+  await fetch(`/api/novo?quantidade=${n}`, { method: 'POST' });
+});
+
+document.getElementById('pararTodosBtn').addEventListener('click', async () => {
+  fantasmas.forEach((g) => { g.estado = "pausado"; });
+  desenharTabela(); atualizarContadores();
+  await fetch('/api/pararTodos', { method: 'POST' });
+});
+
+document.getElementById('continuarTodosBtn').addEventListener('click', async () => {
+  fantasmas.forEach((g) => { g.estado = "ativo"; });
+  desenharTabela(); atualizarContadores();
+  await fetch('/api/continuarTodos', { method: 'POST' });
+});
+
+document.getElementById('matarTodosBtn').addEventListener('click', async () => {
+  await fetch('/api/matarTodos', { method: 'POST' });
+});
+
+document.getElementById('limparLogsBtn').addEventListener('click', () => { logs.innerHTML = ''; });
+
+document.getElementById('refreshBtn').addEventListener('click', () => { location.reload(); });
+
+document.getElementById('ajudaBtn').addEventListener('click', () => {
+  alert("Labirinto dos Processos\n\nCada fantasma representa um processo que precisa completar 3 tarefas (nos pontos C) antes de sair pelo S. O G é um gargalo controlado por semáforo onde apenas um processo pode passar por vez.\n\nUse os botões para controlar os processos individualmente ou em massa.");
+});
+
+// Inicialização do EventSource
 const es = new EventSource('/eventos');
-const logs=document.getElementById('logs');
-function addLog(linha){
-  const seguro=linha.replace(/[&<>]/g,s=>({ "&":"&amp;","<":"&lt;",">":"&gt;" }[s]));
-  const div=document.createElement('div'); div.innerHTML=seguro; logs.prepend(div);
-  while(logs.childElementCount>300) logs.removeChild(logs.lastChild);
-}
-es.onmessage = (e)=>{
+es.onmessage = (e) => {
   const m = JSON.parse(e.data);
-  if(m.tipo==='ola'){ linhas=m.linhas; colunas=m.colunas; grade=m.labirinto.map(l=>l.split("")); desenharLabirinto(); requestAnimationFrame(animar); }
-  else if(m.tipo==='instantaneo'){ (m.dados||[]).forEach(inserirOuAtualizar); }
-  else if(m.tipo==='agente'){
+  if (m.tipo === 'ola') {
+    linhas = m.linhas; colunas = m.colunas; grade = m.labirinto.map(l => l.split(""));
+    desenharLabirinto(); requestAnimationFrame(animar);
+  }
+  else if (m.tipo === 'instantaneo') {
+    (m.dados || []).forEach(inserirOuAtualizar);
+  }
+  else if (m.tipo === 'agente') {
     inserirOuAtualizar(m.dados);
-    if(m.dados.tipo==='saida' || m.dados.tipo==='fim'){
-      setTimeout(()=>fantasmas.delete(m.dados.pid) && desenharTabela(), 400);
+    if (m.dados.tipo === 'saida' || m.dados.tipo === 'fim') {
+      processosFinalizados++; atualizarEstatisticas();
+      setTimeout(() => { fantasmas.delete(m.dados.pid); desenharTabela(); }, 400);
     }
   }
-  else if(m.tipo==='log'){ addLog(m.linha); }
-  else if(m.tipo==='logs'){ logs.innerHTML=''; (m.dados||[]).slice().reverse().forEach(addLog); }
+  else if (m.tipo === 'log') {
+    // Gera HTML formatado aqui (local, seguro) — não exibir tags cruas vindas do servidor
+    const parts = m.linha.split(' | ');
+    if (parts.length >= 3) {
+      const time = parts[0];
+      const processInfo = parts[1];
+      const activity = parts.slice(2).join(' | ');
+      const formattedLog = `
+        <span class="log-time">${time}</span>
+        <span class="log-name">${processInfo}</span>
+        <span class="log-activity">${activity}</span>`;
+      addLog(formattedLog, true);
+    } else {
+      addLog(m.linha, false);
+    }
+  }
+  else if (m.tipo === 'logs') {
+    logs.innerHTML = '';
+    (m.dados || []).slice().reverse().forEach(line => addLog(line, false));
+  }
 };
 </script>
 </body>
@@ -663,7 +1067,9 @@ def principal():
     # Cria alguns agentes iniciais (nascem em células caminháveis, longe de S/C/G)
     gerar(4)
     print("UI disponível em: http://localhost:5000")
+    # Em Windows, certifique-se de executar via 'python -m' ou diretamente este script
     app.run(host="0.0.0.0", port=5000, debug=False)
 
 if __name__ == "__main__":
+    # No Windows (spawn), garanta o guard para evitar recursão na criação de processos
     principal()
